@@ -1,8 +1,8 @@
 import logging
 import sys
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any, Generic, TypeVar
-from collections.abc import Mapping
 
 from opentelemetry import trace
 
@@ -16,25 +16,24 @@ START = sys.intern("__start__")
 END = sys.intern("__end__")
 
 
-StateT = TypeVar("StateT", bound=Mapping[str, Any])
+@dataclass
+class Node:
+    component: PipelineComponent
 
 
 @dataclass
-class Edge:
-    from_node_name: str
+class SimpleEdge:
     to_node_name: str
 
 
 @dataclass
 class ConditionalEdge:
-    from_node_name: str
     to_node_names: list[str]
-    component: PipelineComponent
+    component: PipelineComponent | Callable[..., str]
 
 
-@dataclass
-class Node:
-    component: PipelineComponent
+StateT = TypeVar("StateT", bound=Mapping[str, Any])
+Edge = SimpleEdge | ConditionalEdge
 
 
 class StateGraph(Generic[StateT]):
@@ -42,32 +41,65 @@ class StateGraph(Generic[StateT]):
     A pipeline that runs a graph of a dependency graph.
     """
 
-    # TODO: async
-    # TODO: accept initial state
-    # TODO: allow callable
+    # TODO: compatibility with normal pipeline elements
+    # TODO: from yaml
 
     nodes: dict[str, Node]
-    edges: list[Edge | ConditionalEdge]
+    edges: dict[str, Edge]
 
     state_schema: type[StateT]
 
     def __init__(self, state_schema: type[StateT]):
         self.nodes = {}
-        self.edges = []
+        self.edges = {}
 
         self.state_schema = state_schema
 
-    def _get_edge_from(self, node_name: str) -> Edge | ConditionalEdge:
-        # TODO: replace to map and check on duplicates
-        matches = [d for d in self.edges if d.from_node_name == node_name]
+    def _validate_new_edge(self, source_node: str, target_nodes: list[str]):
+        """
+        Validates a new edge.
 
-        if not matches:
-            raise ValueError(f"No edge found from node '{node_name}'.")
+        Args:
+            source_node (str): The source node.
+            target_nodes (list[str]): The target nodes.
 
-        if len(matches) > 1:
-            raise ValueError(f"Multiple edges found from node '{node_name}'.")
+        Raises:
+            ValueError: If the edge is invalid.
+        """
+        if source_node not in self.nodes and source_node not in (START, END):
+            raise ValueError(f"Source node {source_node} does not exist in the graph.")
 
-        return matches[0]
+        for target_node in target_nodes:
+            if target_node not in self.nodes and target_node not in (START, END):
+                raise ValueError(
+                    f"Target node {target_node} does not exist in the graph."
+                )
+
+        if source_node in self.edges:
+            raise ValueError(f"Source node {source_node} already has an outgoing edge.")
+
+    def _validate_graph(self):
+        """
+        Validates the graph.
+
+        The following conditions must be met:
+        - START and END nodes must be connected
+
+        Raises:
+            ValueError: If the graph is invalid.
+        """
+        if START not in self.edges:
+            raise ValueError("Graph must have a START node connected.")
+
+        connected_edges = set()
+        for edge in self.edges.values():
+            if isinstance(edge, SimpleEdge):
+                connected_edges.add(edge.to_node_name)
+            elif isinstance(edge, ConditionalEdge):
+                connected_edges.update(edge.to_node_names)
+
+        if END not in connected_edges:
+            raise ValueError("Graph must have an END node connected.")
 
     def add_module(
         self,
@@ -81,9 +113,11 @@ class StateGraph(Generic[StateT]):
             node_name (str): The name of the module.
             node (PipelineComponent): The module to add.
         """
-        node_component: PipelineComponent
+        if node_name in self.nodes:
+            raise ValueError(f"Node {node_name} already exists in the graph.")
 
-        # Nodes must be ChainableProducer or PipelineComponent or callable
+        # Nodes must be PipelineComponent or callable
+        node_component: PipelineComponent
         if isinstance(node, ChainableProducer):
             module_component = node.as_module_component()
             node_component = module_component
@@ -110,11 +144,10 @@ class StateGraph(Generic[StateT]):
             source_node (str): The name of the source node.
             target_node (str): The name of the target node.
         """
-        self.edges.append(
-            Edge(
-                from_node_name=source_node,
-                to_node_name=target_node,
-            )
+        self._validate_new_edge(source_node, [target_node])
+
+        self.edges[source_node] = SimpleEdge(
+            to_node_name=target_node,
         )
 
     def branch(
@@ -123,54 +156,109 @@ class StateGraph(Generic[StateT]):
         node: PipelineComponent,
         path_map: list[str],
     ):
-        self.edges.append(
-            ConditionalEdge(
-                from_node_name=node_name,
-                to_node_names=path_map,
-                component=node,
-            )
+        self._validate_new_edge(node_name, path_map)
+
+        self.edges[node_name] = ConditionalEdge(
+            to_node_names=path_map,
+            component=node,
         )
 
-    def _evaluate_edge(self, edge: Edge | ConditionalEdge, state: StateT) -> str:
-        if isinstance(edge, Edge):
-            return edge.to_node_name
-
-        elif isinstance(edge, ConditionalEdge):
-            node_name = edge.component(**state)
-            if node_name not in edge.to_node_names:
-                raise ValueError(
-                    f"Branch node returned invalid path '{node_name}', expected one of {edge.to_node_names}."
-                )
-            return node_name
-
-        else:
-            raise ValueError("Unknown edge type.")
-
-    def run(self) -> StateT:
+    def run(self, initial_state: StateT | None = None) -> StateT:
         """
         Run the pipeline.
+
+        Args:
+            initial_state (StateT | None): The initial state of the pipeline. If None, an empty state will be used.
 
         Returns:
             StateT: The state of the pipeline.
         """
-        state = self.state_schema()
+        self._validate_graph()
 
-        current_edge = self._get_edge_from(START)
+        state = self.state_schema() if initial_state is None else initial_state
+
+        current_edge = self.edges[START]
 
         while True:
-            node_name = self._evaluate_edge(current_edge, state)
+            # Evaluate the current edge to get the next node
+            node_name = None
+            if isinstance(current_edge, SimpleEdge):
+                node_name = current_edge.to_node_name
+            elif isinstance(current_edge, ConditionalEdge):
+                node_name = current_edge.component(**state)
+                if node_name not in current_edge.to_node_names:
+                    raise ValueError(
+                        f"Branch node returned invalid path '{node_name}', expected one of {current_edge.to_node_names}."
+                    )
+            else:
+                raise ValueError("Unknown edge type.")
+
+            # Check for end node
             if node_name == END:
                 break
 
+            # Execute the node
             node = self.nodes[node_name]
-
             try:
                 log.debug(f"State before node {node_name}: {state}")
 
                 state = node.component(**state)
 
                 # Get the next edge
-                current_edge = self._get_edge_from(node_name)
+                current_edge = self.edges[node_name]
+
+            except Exception as e:
+                log.error(f"Error running node {node_name}: {e!s}")
+                raise
+
+        return state
+
+    async def a_run(self, initial_state: StateT | None = None) -> StateT:
+        """
+        Run the pipeline asynchronously.
+
+        Args:
+            initial_state (StateT | None): The initial state of the pipeline. If None, an empty state will be used.
+
+        Returns:
+            StateT: The state of the pipeline.
+        """
+        self._validate_graph()
+
+        state = self.state_schema() if initial_state is None else initial_state
+
+        current_edge = self.edges[START]
+
+        while True:
+            # Evaluate the current edge to get the next node
+            node_name = None
+            if isinstance(current_edge, SimpleEdge):
+                node_name = current_edge.to_node_name
+            elif isinstance(current_edge, ConditionalEdge):
+                if isinstance(current_edge.component, PipelineComponent):
+                    node_name = await current_edge.component.a_run(**state)
+                else:
+                    node_name = current_edge.component(**state)
+                if node_name not in current_edge.to_node_names:
+                    raise ValueError(
+                        f"Branch node returned invalid path '{node_name}', expected one of {current_edge.to_node_names}."
+                    )
+            else:
+                raise ValueError("Unknown edge type.")
+
+            # Check for end node
+            if node_name == END:
+                break
+
+            # Execute the node
+            node = self.nodes[node_name]
+            try:
+                log.debug(f"State before node {node_name}: {state}")
+
+                state = await node.component.a_run(**state)
+
+                # Get the next edge
+                current_edge = self.edges[node_name]
 
             except Exception as e:
                 log.error(f"Error running node {node_name}: {e!s}")

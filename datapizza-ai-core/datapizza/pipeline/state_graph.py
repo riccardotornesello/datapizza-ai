@@ -1,11 +1,12 @@
 import logging
 import sys
-from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Generic, TypeVar
+from typing import Any, Generic, TypeVar
+from collections.abc import Mapping
 
 from opentelemetry import trace
 
+from datapizza.core.models import ChainableProducer, PipelineComponent
 
 tracer = trace.get_tracer(__name__)
 log = logging.getLogger(__name__)
@@ -15,64 +16,38 @@ START = sys.intern("__start__")
 END = sys.intern("__end__")
 
 
-StateT = TypeVar("StateT", bound=dict)
+StateT = TypeVar("StateT", bound=Mapping[str, Any])
 
 
 @dataclass
 class Edge:
     from_node_name: str
     to_node_name: str
-    src_key: str | None
-    dst_key: str
 
 
-class StateComponent(Generic[StateT], ABC):
-    def __call__(self, state: StateT) -> StateT:
-        return self.run(state)
-
-    def validate_input(self, state: StateT):
-        """
-        Validate the input of the component.
-        """
-        assert 1 == 1
-
-    def validate_output(self, state: StateT):
-        """
-        Validate the output of the component.
-        """
-        assert 1 == 1
-
-    def run(self, state: StateT) -> StateT:
-        """
-        Synchronous execution wrapper around _run with tracing and validation.
-
-        This method is called when the component is executed in a sync context.
-        """
-        with tracer.start_as_current_span(f"StateComponent.{self.__class__.__name__}"):
-            self.validate_input(state)
-            data = self._run(state)
-            self.validate_output(data)
-            return data
-
-    @abstractmethod
-    def _run(self, state: StateT) -> StateT:
-        """
-        The core processing logic of the component.
-
-        Subclasses must implement this method to define their specific behavior.
-        """
-        raise NotImplementedError(
-            f"{self.__class__.__name__} must implement the _run method"
-        )
+@dataclass
+class ConditionalEdge:
+    from_node_name: str
+    to_node_names: list[str]
+    component: PipelineComponent
 
 
-class DagPipeline(Generic[StateT]):
+@dataclass
+class Node:
+    component: PipelineComponent
+
+
+class StateGraph(Generic[StateT]):
     """
     A pipeline that runs a graph of a dependency graph.
     """
 
-    nodes: dict[str, StateComponent[StateT]]
-    edges: list[Edge]
+    # TODO: async
+    # TODO: accept initial state
+    # TODO: allow callable
+
+    nodes: dict[str, Node]
+    edges: list[Edge | ConditionalEdge]
 
     state_schema: type[StateT]
 
@@ -82,37 +57,51 @@ class DagPipeline(Generic[StateT]):
 
         self.state_schema = state_schema
 
-    # get the nodes that depend on the given node
-    def _get_edges_from(self, node_name: str) -> list[Edge]:
-        return [d for d in self.edges if d.from_node_name == node_name]
+    def _get_edge_from(self, node_name: str) -> Edge | ConditionalEdge:
+        # TODO: replace to map and check on duplicates
+        matches = [d for d in self.edges if d.from_node_name == node_name]
 
-    # # get the nodes that the given node depends on
-    # def _get_edges_to(self, node_name: str) -> list[Edge]:
-    #     return [d for d in self.edges if d.to_node_name == node_name]
+        if not matches:
+            raise ValueError(f"No edge found from node '{node_name}'.")
 
-    def add_module(self, node_name: str, node: StateComponent[StateT]):
+        if len(matches) > 1:
+            raise ValueError(f"Multiple edges found from node '{node_name}'.")
+
+        return matches[0]
+
+    def add_module(
+        self,
+        node_name: str,
+        node: PipelineComponent,
+    ):
         """
         Add a module to the pipeline.
 
         Args:
             node_name (str): The name of the module.
-            node (StateComponent): The module to add.
+            node (PipelineComponent): The module to add.
         """
-        # TODO: prevent duplicate names?
+        node_component: PipelineComponent
 
-        # Nodes must be StateComponent or callable
-        if isinstance(node, StateComponent) or callable(node):
-            self.nodes[node_name] = node
-
+        # Nodes must be ChainableProducer or PipelineComponent or callable
+        if isinstance(node, ChainableProducer):
+            module_component = node.as_module_component()
+            node_component = module_component
+        elif isinstance(node, PipelineComponent) or callable(node):
+            node_component = node
         else:
-            raise ValueError(f"Node {node_name} must be a StateComponent or callable.")
+            raise ValueError(
+                f"Node {node_name} must be a ChainableProducer, PipelineComponent, or callable."
+            )
+
+        self.nodes[node_name] = Node(
+            component=node_component,
+        )
 
     def connect(
         self,
         source_node: str,
         target_node: str,
-        target_key: str,
-        source_key: str | None = None,
     ):
         """
         Connect two nodes in the pipeline.
@@ -120,17 +109,42 @@ class DagPipeline(Generic[StateT]):
         Args:
             source_node (str): The name of the source node.
             target_node (str): The name of the target node.
-            target_key (str): The key to store the result of the target node in the source node.
-            source_key (str, optional): The key to retrieve the result of the source node from the target node. Defaults to None.
         """
         self.edges.append(
             Edge(
                 from_node_name=source_node,
                 to_node_name=target_node,
-                src_key=source_key,
-                dst_key=target_key,
             )
         )
+
+    def branch(
+        self,
+        node_name: str,
+        node: PipelineComponent,
+        path_map: list[str],
+    ):
+        self.edges.append(
+            ConditionalEdge(
+                from_node_name=node_name,
+                to_node_names=path_map,
+                component=node,
+            )
+        )
+
+    def _evaluate_edge(self, edge: Edge | ConditionalEdge, state: StateT) -> str:
+        if isinstance(edge, Edge):
+            return edge.to_node_name
+
+        elif isinstance(edge, ConditionalEdge):
+            node_name = edge.component(**state)
+            if node_name not in edge.to_node_names:
+                raise ValueError(
+                    f"Branch node returned invalid path '{node_name}', expected one of {edge.to_node_names}."
+                )
+            return node_name
+
+        else:
+            raise ValueError("Unknown edge type.")
 
     def run(self) -> StateT:
         """
@@ -141,29 +155,22 @@ class DagPipeline(Generic[StateT]):
         """
         state = self.state_schema()
 
-        first_node = self._get_edges_from(START)
-        if not first_node:
-            raise ValueError("No starting node found in the pipeline.")
-        if len(first_node) > 1:
-            raise ValueError("Multiple starting nodes found in the pipeline.")
+        current_edge = self._get_edge_from(START)
 
-        node_name = first_node[0].to_node_name
-        while node_name != END:
+        while True:
+            node_name = self._evaluate_edge(current_edge, state)
+            if node_name == END:
+                break
+
             node = self.nodes[node_name]
+
             try:
-                log.debug(f"Current state: {state}")
-                state = node(state)
+                log.debug(f"State before node {node_name}: {state}")
 
-                # Get the next node
-                edges_from = self._get_edges_from(node_name)
-                if not edges_from:
-                    raise ValueError(f"No outgoing edges from node '{node_name}'.")
-                if len(edges_from) > 1:
-                    raise ValueError(
-                        f"Multiple outgoing edges from node '{node_name}'."
-                    )
+                state = node.component(**state)
 
-                node_name = edges_from[0].to_node_name
+                # Get the next edge
+                current_edge = self._get_edge_from(node_name)
 
             except Exception as e:
                 log.error(f"Error running node {node_name}: {e!s}")

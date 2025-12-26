@@ -1,6 +1,7 @@
+import asyncio
 import logging
 import sys
-from collections.abc import Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from typing import Any, Generic, TypeVar
 
@@ -16,9 +17,82 @@ START = sys.intern("__start__")
 END = sys.intern("__end__")
 
 
+class StateComponentWrapper:
+    def __init__(
+        self,
+        component: PipelineComponent
+        | Callable[..., str]
+        | Callable[..., Awaitable[Any]],
+        default_data: dict[str, Any] | None = None,
+        state_input_remap: dict[str, str] | None = None,
+        output_key: str | None = None,
+    ):
+        self.component = component
+        self.default_data = default_data or {}
+        self.state_input_remap = state_input_remap
+        self.output_key = output_key
+
+    def __call__(self, **kwargs) -> Any:
+        # Check if we are in an async context
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+
+        if loop and loop.is_running():
+            return self.a_run(kwargs)
+        else:
+            return self.run(kwargs)
+
+    def run(self, state: dict[str, Any]) -> Any:
+        input_data = self._get_input(state)
+
+        # If is awaitable, run in event loop
+        if asyncio.iscoroutinefunction(self.component):
+            output_data = asyncio.run(self.component(**input_data))
+        else:
+            output_data = self.component(**input_data)
+
+        return self._get_output(output_data, state)
+
+    async def a_run(self, state: dict[str, Any]) -> Any:
+        input_data = self._get_input(state)
+
+        if isinstance(self.component, PipelineComponent):
+            output_data = await self.component.a_run(**input_data)
+        elif asyncio.iscoroutinefunction(self.component):
+            output_data = await self.component(**input_data)
+        else:
+            output_data = self.component(**input_data)
+
+        return self._get_output(output_data, state)
+
+    def _get_input(self, state: dict[str, Any]) -> dict[str, Any]:
+        input_state = self.default_data.copy()
+
+        if self.state_input_remap is None:
+            for k, v in state.items():
+                input_state[k] = v
+        else:
+            for k, v in state.items():
+                remapped_key = self.state_input_remap.get(k)
+                if remapped_key:
+                    input_state[remapped_key] = v
+
+        return input_state
+
+    def _get_output(self, result: Any, state: dict[str, Any]) -> dict[str, Any]:
+        if self.output_key:
+            output_state = state.copy()
+            output_state[self.output_key] = result
+            return output_state
+        else:
+            return result
+
+
 @dataclass
 class Node:
-    component: PipelineComponent
+    component: StateComponentWrapper
 
 
 @dataclass
@@ -29,7 +103,7 @@ class SimpleEdge:
 @dataclass
 class ConditionalEdge:
     to_node_names: list[str]
-    component: PipelineComponent | Callable[..., str]
+    component: StateComponentWrapper
 
 
 StateT = TypeVar("StateT", bound=Mapping[str, Any])
@@ -41,7 +115,6 @@ class StateGraph(Generic[StateT]):
     A pipeline that runs a graph of a dependency graph.
     """
 
-    # TODO: compatibility with normal pipeline elements
     # TODO: from yaml
 
     nodes: dict[str, Node]
@@ -104,25 +177,27 @@ class StateGraph(Generic[StateT]):
     def add_module(
         self,
         node_name: str,
-        node: PipelineComponent,
+        node: StateComponentWrapper | PipelineComponent,
     ):
         """
         Add a module to the pipeline.
 
         Args:
             node_name (str): The name of the module.
-            node (PipelineComponent): The module to add.
+            node (StateComponentWrapper | PipelineComponent): The module to add.
         """
         if node_name in self.nodes:
             raise ValueError(f"Node {node_name} already exists in the graph.")
 
         # Nodes must be PipelineComponent or callable
-        node_component: PipelineComponent
+        node_component: StateComponentWrapper
         if isinstance(node, ChainableProducer):
             module_component = node.as_module_component()
-            node_component = module_component
-        elif isinstance(node, PipelineComponent) or callable(node):
+            node_component = StateComponentWrapper(module_component)
+        elif isinstance(node, StateComponentWrapper):
             node_component = node
+        elif isinstance(node, PipelineComponent) or callable(node):
+            node_component = StateComponentWrapper(node)
         else:
             raise ValueError(
                 f"Node {node_name} must be a ChainableProducer, PipelineComponent, or callable."
@@ -153,14 +228,24 @@ class StateGraph(Generic[StateT]):
     def branch(
         self,
         node_name: str,
-        node: PipelineComponent,
+        node: StateComponentWrapper | PipelineComponent,
         path_map: list[str],
     ):
         self._validate_new_edge(node_name, path_map)
 
+        node_component: StateComponentWrapper
+        if isinstance(node, StateComponentWrapper):
+            node_component = node
+        elif isinstance(node, PipelineComponent) or callable(node):
+            node_component = StateComponentWrapper(node)
+        else:
+            raise ValueError(
+                f"Node {node_name} must be a StateComponentWrapper, PipelineComponent, or callable."
+            )
+
         self.edges[node_name] = ConditionalEdge(
             to_node_names=path_map,
-            component=node,
+            component=node_component,
         )
 
     def run(self, initial_state: StateT | None = None) -> StateT:
@@ -236,7 +321,7 @@ class StateGraph(Generic[StateT]):
                 node_name = current_edge.to_node_name
             elif isinstance(current_edge, ConditionalEdge):
                 if isinstance(current_edge.component, PipelineComponent):
-                    node_name = await current_edge.component.a_run(**state)
+                    node_name = await current_edge.component(**state)
                 else:
                     node_name = current_edge.component(**state)
                 if node_name not in current_edge.to_node_names:
@@ -255,7 +340,7 @@ class StateGraph(Generic[StateT]):
             try:
                 log.debug(f"State before node {node_name}: {state}")
 
-                state = await node.component.a_run(**state)
+                state = await node.component(**state)
 
                 # Get the next edge
                 current_edge = self.edges[node_name]
